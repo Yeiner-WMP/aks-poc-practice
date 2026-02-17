@@ -1,0 +1,25 @@
+# Version control
+.git/
+.gitignore
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Environment / secrets
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# Docs (not needed in image)
+*.md
+LICENSE
+
+# OS
+.DS_Store
