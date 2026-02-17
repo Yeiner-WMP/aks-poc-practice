@@ -1,0 +1,207 @@
+name: Deploy ACR Terraform
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Choose Terraform action"
+        required: true
+        type: choice
+        options: [plan -> apply, destroy]
+      environment:
+        description: "Environment"
+        required: true
+        type: choice
+        default: poc
+        options: [poc]
+
+permissions:
+  contents: read
+  id-token: write   # required for Azure OIDC login
+  actions: read
+
+concurrency:
+# Prevent overlapping Terraform runs for the same environment
+  group: terraform-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  # Terraform non interactive settings for CI
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_WORKING_DIR: "terraform/acr"
+  TF_VERSION: "1.11.4"
+  TF_VAR_acr_name: ${{ vars.ACR_NAME }} # Pass ACR name into Terraform via TF_VAR to avoid duplicating in tfvars - store this in GitHub variables
+
+  # Azure auth via OIDC - store these in GitHub secrets
+  ARM_USE_OIDC: "true"
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  # Terraform Backend (Azure Storage) - store these in GitHub secrets
+  TF_BACKEND_RG: ${{ secrets.BACKEND_AZURE_RESOURCE_GROUP_NAME }}
+  TF_BACKEND_SA: ${{ secrets.BACKEND_AZURE_STORAGE_ACCOUNT_NAME }}
+  TF_BACKEND_CONTAINER: ${{ secrets.BACKEND_AZURE_STORAGE_ACCOUNT_CONTAINER_NAME }}
+
+jobs:
+  plan:
+    name: Terraform Plan
+    if: ${{ inputs.action == 'plan -> apply' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # Backend key is set here rather than in Terraform code
+      - name: Terraform Init (AzureRM remote backend)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -upgrade \
+            -backend-config="resource_group_name=${TF_BACKEND_RG}" \
+            -backend-config="storage_account_name=${TF_BACKEND_SA}" \
+            -backend-config="container_name=${TF_BACKEND_CONTAINER}" \
+            -backend-config="key=acr_${{ inputs.environment }}.tfstate"
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      # tfvars holds deployment specific inputs like RG name and tags
+      - name: Terraform Plan (create plan file)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var-file="vars/${{ inputs.environment }}.tfvars" \
+            -out="tfplan"
+
+      - name: Terraform Show (human-readable)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform show -no-color tfplan > tfplan.txt
+
+      # Persist the exact plan that will be applied
+      - name: Upload plan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}-${{ github.run_id }}
+          path: |
+            ${{ env.TF_WORKING_DIR }}/tfplan
+            ${{ env.TF_WORKING_DIR }}/tfplan.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Add plan to job summary
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          echo "## Terraform Plan (${{ inputs.environment }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          # Keep summary reasonable size
+          head -n 400 tfplan.txt >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  apply:
+    name: Terraform Apply (approval required)
+    if: ${{ inputs.action == 'plan -> apply' }}
+    needs: [plan]
+    runs-on: ubuntu-latest
+
+    # This is what enforces manual approval (configure required reviewers in repo settings)
+    environment:
+      name: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download plan artifact from this run
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init (AzureRM remote backend)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -upgrade \
+            -backend-config="resource_group_name=${TF_BACKEND_RG}" \
+            -backend-config="storage_account_name=${TF_BACKEND_SA}" \
+            -backend-config="container_name=${TF_BACKEND_CONTAINER}" \
+            -backend-config="key=acr_${{ inputs.environment }}.tfstate"
+
+      - name: Verify plan exists
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          ls -la
+          test -f tfplan
+          test -f tfplan.txt
+
+      - name: Terraform Apply (apply EXACT plan)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan
+
+  destroy:
+    name: Terraform Destroy
+    if: ${{ inputs.action == 'destroy' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init (AzureRM remote backend)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -upgrade \
+            -backend-config="resource_group_name=${TF_BACKEND_RG}" \
+            -backend-config="storage_account_name=${TF_BACKEND_SA}" \
+            -backend-config="container_name=${TF_BACKEND_CONTAINER}" \
+            -backend-config="key=acr_${{ inputs.environment }}.tfstate"
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      - name: "Terraform Destroy"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform destroy -auto-approve
