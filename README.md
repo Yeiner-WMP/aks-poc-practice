@@ -1,6 +1,25 @@
 # AKS PoC — Python Web Service
 
-Minimal, production-ready FastAPI service with a styled landing page and Kubernetes health check, containerized for AKS deployment.
+Production-ready FastAPI web service deployed to Azure Kubernetes Service (AKS) with Terraform and GitHub Actions. Fully automated infrastructure-as-code pipeline: push code, build container, deploy to Kubernetes.
+
+## Architecture
+
+```
+app/main.py ──> Dockerfile ──> Container Image ──> ACR ──> AKS ──> Public URL
+                                                    │
+                                          Terraform defines all of this
+                                                    │
+                                          GitHub Actions automates it
+```
+
+| Layer | Technology |
+|-------|-----------|
+| Application | Python 3.12 · FastAPI · Uvicorn |
+| Container | Docker · python:3.12-slim · non-root |
+| Registry | Azure Container Registry (ACR) |
+| Orchestration | Azure Kubernetes Service (AKS) |
+| Infrastructure | Terraform (AzureRM + Kubernetes providers) |
+| CI/CD | GitHub Actions · OIDC authentication |
 
 ## Project Structure
 
@@ -8,11 +27,24 @@ Minimal, production-ready FastAPI service with a styled landing page and Kuberne
 aks-poc-practice/
 ├── app/
 │   ├── __init__.py
-│   └── main.py            # Application entrypoint (routes, middleware, template)
-├── Dockerfile              # Production container (python:3.12-slim, non-root)
-├── .dockerignore
-├── .gitignore
+│   └── main.py                          # FastAPI app (routes, middleware, HTML template)
+├── terraform/
+│   ├── acr/                             # ACR module (container registry)
+│   │   ├── main.tf
+│   │   ├── providers.tf
+│   │   ├── variables.tf
+│   │   └── vars/poc.tfvars
+│   └── aks/                             # AKS module (cluster + K8s resources)
+│       ├── main.tf
+│       ├── providers.tf
+│       ├── variables.tf
+│       └── vars/poc.tfvars
+├── .github/workflows/
+│   ├── deploy_acr.yaml                  # ACR plan / apply / destroy
+│   └── deploy_aks.yaml                  # AKS plan / build+push / apply / destroy
+├── Dockerfile
 ├── requirements.txt
+├── Step-by-Step Guide.md                # Full walkthrough for first-time deployment
 └── README.md
 ```
 
@@ -35,12 +67,16 @@ docker run --rm -p 8080:8080 aks-poc
 
 Then open [http://localhost:8080](http://localhost:8080).
 
-## API Reference
+### Full AKS deployment
 
-| Method | Path       | Content-Type               | Description                        |
-|--------|------------|----------------------------|------------------------------------|
-| GET    | `/`        | `text/html; charset=utf-8` | Styled landing page with server info |
-| GET    | `/healthz` | `application/json`         | `{"status":"ok"}` — K8s probe target |
+See **[Step-by-Step Guide.md](Step-by-Step%20Guide.md)** for the complete walkthrough — from Azure prerequisites through GitHub Actions to a live public URL.
+
+## Endpoints
+
+| Method | Path       | Content-Type               | Description                          |
+|--------|------------|----------------------------|--------------------------------------|
+| GET    | `/`        | `text/html; charset=utf-8` | Styled landing page (greeting, server time, port) |
+| GET    | `/healthz` | `application/json`         | `{"status":"ok"}` — Kubernetes probe target |
 
 ## Configuration
 
@@ -48,7 +84,49 @@ Then open [http://localhost:8080](http://localhost:8080).
 |----------|---------|--------------------|
 | `PORT`   | `8080`  | Server listen port |
 
-## Architecture Decisions
+## Deployment Workflows
+
+Both workflows are triggered manually via **Actions > Run workflow** with `plan -> apply` or `destroy`.
+
+### Deploy ACR (`deploy_acr.yaml`)
+
+Creates the Azure Container Registry. Run this **once** before deploying AKS.
+
+- **Plan** — `terraform plan` with environment tfvars
+- **Apply** — requires environment approval, then `terraform apply`
+- **Destroy** — `terraform destroy` with environment tfvars
+
+### Deploy AKS (`deploy_aks.yaml`)
+
+Creates the AKS cluster, builds and pushes the Docker image, and deploys Kubernetes resources.
+
+- **Plan** — `terraform plan` (image tagged with Git SHA)
+- **Apply** — builds Docker image, pushes to ACR, applies the Terraform plan
+- **Destroy** — targeted destroy of K8s resources + AKS cluster
+
+### GitHub Configuration Required
+
+**Repository Variables:**
+
+| Name | Example | Purpose |
+|------|---------|---------|
+| `ACR_NAME` | `acrakspocpractice` | ACR registry name |
+| `IMAGE_NAME` | `helloworld-python-poc` | Docker image repository name |
+
+**Repository Secrets:**
+
+| Name | Purpose |
+|------|---------|
+| `AZURE_CLIENT_ID` | Managed identity Client ID (OIDC) |
+| `AZURE_TENANT_ID` | Azure AD Tenant ID |
+| `AZURE_SUBSCRIPTION_ID` | Azure Subscription ID |
+| `BACKEND_AZURE_RESOURCE_GROUP_NAME` | Terraform state storage RG |
+| `BACKEND_AZURE_STORAGE_ACCOUNT_NAME` | Terraform state storage account |
+| `BACKEND_AZURE_STORAGE_ACCOUNT_CONTAINER_NAME` | Terraform state blob container |
+
+**Environment:** `poc` (with optional required reviewer for approval gates)
+
+## Application Design
 
 | Decision | Rationale |
 |----------|-----------|
@@ -57,34 +135,25 @@ Then open [http://localhost:8080](http://localhost:8080).
 | **`_render_page()` as pure function** | Separates template logic from route handling; trivially testable |
 | **HTTP middleware for logging** | Captures every request method + path + status without touching route code |
 | **No Swagger UI** | `docs_url=None` reduces attack surface in production |
-| **Non-root container user** | Required by AKS pod security standards and general best practice |
-| **Dependency layer caching** | `requirements.txt` copied before app code — rebuilds only when deps change |
 
 ## Container Security
 
-The Dockerfile follows container hardening best practices:
+| Practice | Detail |
+|----------|--------|
+| Minimal base image | `python:3.12-slim` |
+| Non-root user | System user `app` — no login shell, no home directory |
+| No bytecode | `PYTHONDONTWRITEBYTECODE=1` |
+| Unbuffered output | `PYTHONUNBUFFERED=1` for reliable container log collection |
+| Layer caching | Dependencies installed before app code — faster rebuilds |
+| K8s compatible | Works with `runAsNonRoot: true` and restricted Pod Security Standards |
 
-- Base image: `python:3.12-slim` (minimal attack surface)
-- Runs as system user `app` (non-root, no login shell)
-- No `.pyc` generation (`PYTHONDONTWRITEBYTECODE=1`)
-- Unbuffered output (`PYTHONUNBUFFERED=1`) for reliable container logging
-- Compatible with Kubernetes `runAsNonRoot: true` without modification
+## Infrastructure Design
 
-## Kubernetes Usage
-
-Point liveness and readiness probes at the health endpoint:
-
-```yaml
-livenessProbe:
-  httpGet:
-    path: /healthz
-    port: 8080
-  initialDelaySeconds: 5
-  periodSeconds: 10
-readinessProbe:
-  httpGet:
-    path: /healthz
-    port: 8080
-  initialDelaySeconds: 3
-  periodSeconds: 5
-```
+| Decision | Rationale |
+|----------|-----------|
+| **ACR and AKS in separate Terraform modules** | ACR is stable; AKS changes with every deploy. Separation reduces blast radius |
+| **No Terraform remote state references** | AKS looks up ACR by name via `data` source — keeps modules loosely coupled |
+| **OIDC authentication** | No stored secrets for Azure auth — GitHub Actions exchanges a token directly |
+| **System-assigned AKS identity** | Simplest auth model; Terraform grants `AcrPull` via role assignment |
+| **Targeted destroy for AKS** | Destroys K8s resources before the cluster to avoid orphaned state |
+| **`-var-file` on all paths** | Plan, apply, and destroy all receive the same tfvars to prevent missing-variable errors |
