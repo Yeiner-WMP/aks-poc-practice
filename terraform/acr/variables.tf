@@ -1,16 +1,19 @@
 variable "resource_group_name" {
   type        = string
   description = "Name of the existing Azure Resource Group where the ACR will be deployed."
+  default     = ""
 }
 
 variable "acr_name" {
   type        = string
   description = "Name of the Azure Container Registry."
+  default     = ""
 }
 
 variable "tags" {
   type        = map(string)
   description = "Tags to apply to resources. Tag keys must remain the same (e.g., \"Owner 1\", \"Owner 2\", \"Client Code\")."
+  default     = {}
 }
 
 variable "acr_sku" {
