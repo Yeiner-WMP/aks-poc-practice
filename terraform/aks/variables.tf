@@ -31,6 +31,7 @@ variable "image_name" {
 variable "image_tag" {
   type        = string
   description = "Docker image tag (typically the Git SHA). Passed by workflow at plan/apply time."
+  default     = "latest"
 }
 
 variable "tags" {
