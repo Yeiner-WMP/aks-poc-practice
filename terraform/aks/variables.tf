@@ -37,6 +37,7 @@ variable "image_tag" {
 variable "tags" {
   type        = map(string)
   description = "Tags to apply to Azure resources. Tag keys must remain the same (e.g., \"Owner 1\", \"Owner 2\", \"Client Code\")."
+  default     = {}
 }
 
 variable "default_node_pool_node_count" {
